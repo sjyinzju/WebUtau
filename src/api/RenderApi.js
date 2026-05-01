@@ -1,0 +1,130 @@
+import { RENDER_API_BASE_URL, buildRenderApiUrl } from '../config/serviceEndpoints.js'
+
+let _audioCtx = null
+
+function _getAudioContext() {
+  if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)()
+  return _audioCtx
+}
+
+function _buildPhraseDownloadUrl(jobId, phraseIndex, versionKey = null) {
+  const url = new URL(buildRenderApiUrl(`/api/jobs/${jobId}/phrases/${phraseIndex}`), window.location.origin)
+  if (typeof versionKey === 'string' && versionKey) {
+    url.searchParams.set('v', versionKey)
+  }
+  return url.toString()
+}
+
+const renderApi = {
+  async submitJob(midiFile, singerId, language, options = {}) {
+    const formData = new FormData()
+    formData.append('midi', midiFile)
+    formData.append('singerId', singerId)
+    formData.append('defaultLanguageCode', language)
+    if (Array.isArray(options?.noteParams) && options.noteParams.length > 0) {
+      formData.append('noteParamsJson', JSON.stringify(options.noteParams))
+    }
+
+    const response = await fetch(buildRenderApiUrl('/api/synthesize'), {
+      method: 'POST',
+      body: formData,
+    })
+    return response.json()
+  },
+  async getJobStatus(jobId) {
+    const response = await fetch(buildRenderApiUrl(`/api/jobs/${jobId}`))
+    return response.json()
+  },
+  async downloadPhrase(jobId, phraseIndex, versionKey = null) {
+    const response = await fetch(_buildPhraseDownloadUrl(jobId, phraseIndex, versionKey), {
+      cache: 'no-store',
+    })
+    if (!response.ok) throw new Error(`downloadPhrase failed: ${response.status}`)
+    const arrayBuffer = await response.arrayBuffer()
+    const audioContext = _getAudioContext()
+    return audioContext.decodeAudioData(arrayBuffer)
+  },
+  async downloadJob(jobId) {
+    const response = await fetch(buildRenderApiUrl(`/api/jobs/${jobId}/download`))
+    if (!response.ok) throw new Error(`downloadJob failed: ${response.status}`)
+    return response.blob()
+  },
+  async setPriority(jobId, phraseIndex) {
+    await fetch(buildRenderApiUrl(`/api/jobs/${jobId}/priority`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phraseIndex }),
+    })
+  },
+  async getPitch(jobId) {
+    const response = await fetch(buildRenderApiUrl(`/api/jobs/${jobId}/pitch`))
+    if (!response.ok) throw new Error(`getPitch failed: ${response.status}`)
+    return response.json()
+  },
+  async getPhonemeTimings(jobId) {
+    const response = await fetch(buildRenderApiUrl(`/api/jobs/${jobId}/phoneme-timings`))
+    const data = await response.json().catch(() => null)
+    if (!response.ok) {
+      throw new Error(data?.error || `getPhonemeTimings failed: ${response.status}`)
+    }
+    return data
+  },
+  async applyPitchDeviation(jobId, deviation) {
+    const response = await fetch(buildRenderApiUrl(`/api/jobs/${jobId}/pitch`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviation }),
+    })
+    const data = await response.json().catch(() => null)
+    if (!response.ok) {
+      throw new Error(data?.error || `applyPitchDeviation failed: ${response.status}`)
+    }
+    return data
+  },
+  async applyNoteParams(jobId, notes) {
+    const response = await fetch(buildRenderApiUrl(`/api/jobs/${jobId}/note-params`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes }),
+    })
+    const data = await response.json().catch(() => null)
+    if (!response.ok) {
+      throw new Error(data?.error || `applyNoteParams failed: ${response.status}`)
+    }
+    return data
+  },
+  async deleteJob(jobId) {
+    const response = await fetch(buildRenderApiUrl(`/api/jobs/${jobId}`), {
+      method: 'DELETE',
+    })
+    if (!response.ok && response.status !== 404) {
+      throw new Error(`deleteJob failed: ${response.status}`)
+    }
+  },
+  /**
+   * 心跳：告诉后端这个 job 的客户端还在。
+   * 返回 true = 心跳被后端接受；false = 404（job 已结束或被清理），前端应停止后续心跳。
+   */
+  async heartbeat(jobId) {
+    const response = await fetch(buildRenderApiUrl(`/api/jobs/${jobId}/heartbeat`), {
+      method: 'POST',
+    })
+    if (response.status === 404) return false
+    if (!response.ok) throw new Error(`heartbeat failed: ${response.status}`)
+    return true
+  },
+  async editNotes(jobId, edits) {
+    const response = await fetch(buildRenderApiUrl(`/api/jobs/${jobId}/edit-notes`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ edits }),
+    })
+    const data = await response.json().catch(() => null)
+    if (!response.ok) {
+      throw new Error(data?.error || `edit-notes failed: ${response.status}`)
+    }
+    return data
+  },
+}
+
+export default renderApi

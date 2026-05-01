@@ -1,0 +1,424 @@
+import eventBus from '../../core/EventBus.js'
+import phraseStore from '../../core/PhraseStore.js'
+import playbackEngine from '../../modules/PlaybackEngine.js'
+import playheadController from '../../modules/PlayheadController.js'
+import renderCache from '../../modules/RenderCache.js'
+import midiEncoder from '../../modules/MidiEncoder.js'
+import renderJobManager from '../../modules/RenderJobManager.js'
+import noteEditManager from '../../modules/NoteEditManager.js'
+import transportControl from '../../modules/TransportControl.js'
+import lyricEditor from '../../modules/LyricEditor.js'
+import pitchEditor from '../../modules/PitchEditor.js'
+import pianoRoll from '../../ui/PianoRoll.js'
+import trackSelector from '../../ui/TrackSelector.js'
+import prepareOverlay from '../../ui/PrepareOverlay.js'
+import { DEFAULT_LANGUAGE_CODE } from '../../config/languageOptions.js'
+import { EVENTS, PLAYHEAD_STATE } from '../../config/constants.js'
+import { HOST_SHORTCUT_INTENTS, getHostShortcutIntent } from '../../shared/hostShortcutIntents.js'
+import { isKeyboardShortcutTargetEditable } from '../../shared/isKeyboardShortcutTargetEditable.js'
+import { createTimelineAxis } from '../../shared/timelineAxis.js'
+import { createRuntimeEventBindings } from './createRuntimeEventBindings.js'
+import phraseRenderStateStore from './phraseRenderStateStore.js'
+import { EmbeddedPlaybackMirror } from './embeddedPlaybackMirror.js'
+import { buildRuntimeSnapshot, cloneSnapshot } from './runtimeSnapshot.js'
+import { resolveSingerId, selectRuntimeSnapshotFromImport } from './runtimeImportWorkflow.js'
+import { t } from '../../i18n/index.js'
+
+function getRuntimeRefs() {
+  return {
+    btnPlay: document.getElementById('btn-play'),
+    btnImport: document.getElementById('btn-import'),
+    fileInput: document.getElementById('midi-file-input'),
+    statusText: document.getElementById('status-text'),
+    pianoRollContainer: document.getElementById('piano-roll-container'),
+    playhead: document.getElementById('playhead'),
+  }
+}
+
+function getEmbeddedMode() {
+  const query = new URLSearchParams(window.location.search)
+  return query.get('embedded') === '1'
+}
+
+function isUndoShortcut(event) {
+  if (!event || event.repeat) return false
+  if (event.altKey || event.shiftKey) return false
+  if (!(event.metaKey || event.ctrlKey)) return false
+  if (event.code !== 'KeyZ') return false
+  return !isKeyboardShortcutTargetEditable(event.target)
+}
+
+function resetRuntimeState() {
+  renderJobManager.reset()
+  renderCache.clear()
+  phraseStore.setJobId(null)
+  phraseStore.setTempoData(null)
+  phraseStore.setPitchData(null)
+  phraseStore.setPhrases([])
+  transportControl.resetForNewTrack([])
+  playbackEngine.stop()
+}
+
+function getPhraseDuration(phrases = []) {
+  return phrases.reduce((maxValue, phrase) => Math.max(maxValue, phrase?.endTime || 0), 0)
+}
+
+function buildSubmitNoteParams(phrases = [], tempoData = null, ppq = 480) {
+  const axis = createTimelineAxis({
+    tempoData,
+    ppq: Number.isFinite(ppq) && ppq > 0 ? Math.round(ppq) : 480,
+    totalTicks: 0,
+  })
+  return (Array.isArray(phrases) ? phrases : [])
+    .flatMap((phrase) => phrase?.notes || [])
+    .map((note) => {
+      const hasParams = (Number.isFinite(note?.tuning) && Math.round(note.tuning) !== 0) || note?.pitch || note?.vibrato
+      if (!hasParams) return null
+      const startTick = Number.isFinite(note?.tick)
+        ? Math.max(0, Math.round(note.tick))
+        : Math.max(0, Math.round(axis.timeToTick(note?.time || 0)))
+      const endTick = Number.isFinite(note?.tick) && Number.isFinite(note?.durationTicks)
+        ? startTick + Math.max(1, Math.round(note.durationTicks))
+        : Math.max(startTick + 1, Math.round(axis.timeToTick((note?.time || 0) + (note?.duration || 0))))
+      return {
+        position: startTick,
+        duration: Math.max(1, endTick - startTick),
+        tone: Number.isFinite(note?.midi) ? Math.round(note.midi) : 60,
+        tuning: Number.isFinite(note?.tuning) ? Math.round(note.tuning) : 0,
+        pitch: note?.pitch
+          ? {
+            snapFirst: note.pitch?.snapFirst !== false,
+            data: Array.isArray(note.pitch?.data)
+              ? note.pitch.data.map((point) => ({
+                x: Number.isFinite(point?.x) ? point.x : 0,
+                y: Number.isFinite(point?.y) ? point.y : 0,
+                shape: typeof point?.shape === 'string' ? point.shape : 'io',
+              }))
+              : [],
+          }
+          : null,
+        vibrato: note?.vibrato
+          ? {
+            length: Number.isFinite(note.vibrato?.length) ? note.vibrato.length : 0,
+            period: Number.isFinite(note.vibrato?.period) ? note.vibrato.period : 175,
+            depth: Number.isFinite(note.vibrato?.depth) ? note.vibrato.depth : 25,
+            in: Number.isFinite(note.vibrato?.in) ? note.vibrato.in : 10,
+            out: Number.isFinite(note.vibrato?.out) ? note.vibrato.out : 10,
+            shift: Number.isFinite(note.vibrato?.shift) ? note.vibrato.shift : 0,
+            drift: Number.isFinite(note.vibrato?.drift) ? note.vibrato.drift : 0,
+            volLink: Number.isFinite(note.vibrato?.volLink) ? note.vibrato.volLink : 0,
+          }
+          : null,
+      }
+    })
+    .filter(Boolean)
+}
+
+function loadSnapshotIntoRuntime(snapshot) {
+  const phrases = cloneSnapshot(snapshot.phrases) || []
+  const tempoData = cloneSnapshot(snapshot.tempoData)
+  const bpm = snapshot.bpm || tempoData?.tempos?.[0]?.bpm || 120
+  const timeSignature = tempoData?.timeSignatures?.[0]?.timeSignature || [4, 4]
+  const encodedMidi = snapshot.encodedMidi || midiEncoder.encode(phrases, bpm, timeSignature)
+
+  phraseStore.setBpm(bpm)
+  phraseStore.setJobId(snapshot.jobId || null)
+  phraseStore.setTempoData(tempoData)
+  phraseStore.setMidiFile(encodedMidi)
+  phraseStore.setPhrases(phrases)
+  phraseStore.setPitchData(cloneSnapshot(snapshot.pitchData))
+  transportControl.resetForNewTrack(phrases)
+  eventBus.emit(EVENTS.TRACK_SELECTED, {
+    phrases,
+    trackIndex: snapshot.trackIndex,
+    tempoData,
+  })
+}
+
+export function createVoiceRuntimeApp(callbacks = {}) {
+  const refs = getRuntimeRefs()
+  const embedded = getEmbeddedMode()
+  const state = {
+    embedded,
+    trackId: null,
+    trackIndex: null,
+    trackName: t('voiceRuntime.no_track'),
+    languageCode: DEFAULT_LANGUAGE_CODE,
+    tempoData: null,
+  }
+  let suppressDirtyNotifications = 0
+  const playbackMirror = new EmbeddedPlaybackMirror()
+  const bindRuntimeEvents = createRuntimeEventBindings({
+    callbacks,
+    embedded,
+    state,
+    setStatus,
+    buildPlaybackPayload,
+    buildSeekPayload,
+    emitPlaybackState,
+  })
+
+  if (embedded) document.body.classList.add('runtime-embedded')
+  pianoRoll.init(refs.pianoRollContainer)
+  playheadController.init(refs.playhead, {
+    onViewportScrolled: () => pianoRoll.refreshViewportAfterScroll?.(),
+  })
+  trackSelector.init()
+  transportControl.init()
+  transportControl.setLocalInputEnabled(!embedded)
+  prepareOverlay.init()
+  phraseRenderStateStore.init()
+
+  function setStatus(text) {
+    refs.statusText.textContent = text
+  }
+
+  function buildPlaybackPayload(currentTime = playheadController.getPosition()) {
+    const playheadState = playheadController.getState()
+    return {
+      trackId: state.trackId,
+      playing: playheadState !== PLAYHEAD_STATE.STOPPED,
+      currentTime,
+      duration: getPhraseDuration(phraseStore.getPhrases()),
+      state: playheadState,
+    }
+  }
+
+  function buildSeekPayload(currentTime = playheadController.getPosition()) {
+    return {
+      trackId: state.trackId,
+      currentTime: Number.isFinite(currentTime) ? Math.max(0, currentTime) : 0,
+    }
+  }
+
+  function emitPlaybackState(currentTime = playheadController.getPosition()) {
+    if (embedded) return
+    callbacks.onPlaybackState?.(buildPlaybackPayload(currentTime))
+  }
+
+  function notifyDirty() {
+    if (suppressDirtyNotifications > 0) return
+    if (typeof callbacks.onEditorDirty !== 'function' || state.trackId == null) return
+    callbacks.onEditorDirty(buildRuntimeSnapshot(state, phraseStore))
+  }
+
+  async function loadTrack(snapshot) {
+    resetRuntime()
+    lyricEditor.resetHistory?.()
+    pitchEditor.resetHistory?.()
+    state.trackId = snapshot.trackId
+    state.trackIndex = snapshot.trackIndex ?? null
+    state.trackName = snapshot.trackName || t('voiceRuntime.untitled_track')
+    state.languageCode = snapshot.languageCode || DEFAULT_LANGUAGE_CODE
+    state.tempoData = cloneSnapshot(snapshot.tempoData)
+    phraseRenderStateStore.hydrateFromManifest(snapshot.renderManifest)
+    loadSnapshotIntoRuntime(snapshot)
+    console.log('[RuntimeSession] Runtime loadTrack', {
+      trackId: state.trackId,
+      snapshotJobId: snapshot.jobId || null,
+      manifestPhraseCount: snapshot.renderManifest?.phraseStates?.length || 0,
+    })
+    emitPlaybackState(0)
+    setStatus(t('voiceRuntime.track_loaded', { name: state.trackName }))
+  }
+
+  async function startSynthesis(options = {}) {
+    const languageCode = options.languageCode || state.languageCode || DEFAULT_LANGUAGE_CODE
+    const phrases = cloneSnapshot(phraseStore.getPhrases()) || []
+    if (phrases.length === 0) throw new Error(t('voiceRuntime.no_notes'))
+
+    const tempoData = state.tempoData
+    const bpm = tempoData?.tempos?.[0]?.bpm || phraseStore.getBpm() || 120
+    const timeSignature = tempoData?.timeSignatures?.[0]?.timeSignature || [4, 4]
+    const encodedMidi = midiEncoder.encode(phrases, bpm, timeSignature)
+    const noteParams = buildSubmitNoteParams(phrases, tempoData)
+
+    phraseStore.setMidiFile(encodedMidi)
+    state.languageCode = languageCode
+    setStatus(t('voiceRuntime.submitted', { name: state.trackName }))
+    const singerId = options.singerId || await resolveSingerId()
+    await renderJobManager.submitMidi(encodedMidi, singerId, languageCode, { noteParams })
+  }
+
+  async function applyNoteEdits(edits = []) {
+    if (!Array.isArray(edits) || edits.length === 0) {
+      return {
+        affectedIndices: [],
+        snapshot: buildRuntimeSnapshot(state, phraseStore),
+      }
+    }
+    setStatus(t('voiceRuntime.submitting_edits', { name: state.trackName }))
+    suppressDirtyNotifications += 1
+    try {
+      lyricEditor.resetHistory?.()
+      pitchEditor.resetHistory?.()
+      const result = await noteEditManager.applyEdits(edits)
+      return {
+        ...result,
+        snapshot: buildRuntimeSnapshot(state, phraseStore),
+      }
+    } finally {
+      suppressDirtyNotifications = Math.max(0, suppressDirtyNotifications - 1)
+    }
+  }
+
+  async function importMidiFromFile(file) {
+    const snapshot = await selectRuntimeSnapshotFromImport(file)
+    if (!snapshot) {
+      setStatus(t('voiceRuntime.no_available_track'))
+      return
+    }
+    await loadTrack(snapshot)
+    await startSynthesis({ languageCode: snapshot.languageCode })
+  }
+
+  function requestSnapshot() {
+    return buildRuntimeSnapshot(state, phraseStore)
+  }
+
+  function seekTo(time) {
+    if (embedded) {
+      playbackMirror.seekTo(time)
+      return
+    }
+    eventBus.emit(EVENTS.TRANSPORT_SEEK, {
+      time: Number.isFinite(time) ? Math.max(0, time) : 0,
+    })
+  }
+
+  function togglePlayback() {
+    if (embedded) {
+      callbacks.onHostShortcut?.({
+        intent: HOST_SHORTCUT_INTENTS.TOGGLE_PLAYBACK,
+        trackId: state.trackId,
+        source: 'runtime-toolbar',
+      })
+      return
+    }
+    transportControl.togglePlayback(t('voiceRuntime.host_caller'))
+    emitPlaybackState()
+  }
+
+  function setEditorMode(mode) {
+    pianoRoll.setEditorMode?.(mode)
+  }
+
+  function setPlayheadFollowMode(mode) {
+    pianoRoll.setPlayheadFollowMode?.(mode)
+  }
+
+  async function undoEditor() {
+    if (pitchEditor.isEnabled?.()) {
+      const handled = await pitchEditor.undo?.()
+      if (handled) setStatus(t('voiceRuntime.pitch_undo', { name: state.trackName }))
+      return handled
+    }
+    const handled = await lyricEditor.undo?.()
+    if (handled) setStatus(t('voiceRuntime.lyric_undo', { name: state.trackName }))
+    return handled
+  }
+
+  function resetRuntime() {
+    const previousTrackId = state.trackId
+    resetRuntimeState()
+    phraseRenderStateStore.clear()
+    playbackMirror.reset()
+    state.trackId = null
+    state.trackIndex = null
+    state.trackName = '未加载轨道'
+    state.languageCode = DEFAULT_LANGUAGE_CODE
+    state.tempoData = null
+    console.log('[RuntimeSession] Runtime close', {
+      snapshotSaved: Boolean(previousTrackId),
+      localCacheCleared: true,
+    })
+    emitPlaybackState(0)
+    setStatus(embedded ? t('voiceRuntime.runtime_ready_embedded') : t('status.ready'))
+  }
+
+  function bindStandaloneImport() {
+    if (embedded || !refs.btnImport || !refs.fileInput) return
+    refs.btnImport.addEventListener('click', () => refs.fileInput.click())
+    refs.fileInput.addEventListener('change', handleFileInputChange)
+  }
+
+  async function handleFileInputChange(event) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    try {
+      setStatus(t('voiceRuntime.parsing_midi'))
+      await importMidiFromFile(file)
+    } catch (error) {
+      console.error('MIDI 导入失败:', error)
+      setStatus(t('voiceRuntime.midi_failed'))
+    } finally {
+      refs.fileInput.value = ''
+    }
+  }
+
+  function bindEmbeddedShortcutForwarding() {
+    document.addEventListener('keydown', handleEditorUndoShortcut)
+    if (!embedded) return
+    document.addEventListener('keydown', handleEmbeddedShortcut)
+    refs.btnPlay?.addEventListener('click', () => {
+      callbacks.onHostShortcut?.({
+        intent: HOST_SHORTCUT_INTENTS.TOGGLE_PLAYBACK,
+        trackId: state.trackId,
+        source: 'runtime-toolbar',
+      })
+    })
+  }
+
+  function handleEmbeddedShortcut(event) {
+    const intent = getHostShortcutIntent(event)
+    if (!intent) return
+    event.preventDefault()
+    callbacks.onHostShortcut?.({
+      intent,
+      trackId: state.trackId,
+      source: 'runtime-keyboard',
+    })
+  }
+
+  function handleEditorUndoShortcut(event) {
+    if (!isUndoShortcut(event)) return
+    const canUndo = pitchEditor.isEnabled?.()
+      ? pitchEditor.canUndo?.()
+      : lyricEditor.canUndo?.()
+    if (!canUndo) return
+    event.preventDefault()
+    void undoEditor()
+  }
+
+  function syncHostPlaybackState(payload = {}) {
+    if (!embedded) return
+    if (payload.trackId && payload.trackId !== state.trackId) return
+    playbackMirror.applyState(payload)
+  }
+
+  function syncHostPlaybackTick(payload = {}) {
+    if (!embedded) return
+    if (payload.trackId && payload.trackId !== state.trackId) return
+    playbackMirror.applyTick(payload)
+  }
+
+  bindStandaloneImport()
+  bindRuntimeEvents(notifyDirty)
+  bindEmbeddedShortcutForwarding()
+  setStatus(embedded ? '运行时已就绪，等待宿主加载轨道' : '系统就绪')
+
+  return {
+    loadTrack,
+    requestSnapshot,
+    reset: resetRuntime,
+    startSynthesis,
+    applyNoteEdits,
+    seekTo,
+    setEditorMode,
+    setPlayheadFollowMode,
+    syncHostPlaybackState,
+    syncHostPlaybackTick,
+    togglePlayback,
+    undoEditor,
+  }
+}

@@ -1,0 +1,810 @@
+:root {
+  --bg-canvas: #e8e5df;
+  --bg-panel: #f4f2ec;
+  --bg-control: #ffffff;
+  --bg-metal: #e9e5dd;
+  --bg-press: #e2ddd2;
+  --border-main: #d1cec5;
+  --border-dark: #a3a097;
+  --atomic-teal: #3b8b88;
+  --nuka-red: #c94234;
+  --vault-gold: #d4a035;
+  --bakelite-dark: #2b2825;
+  --screen-bg: #1c241d;
+  --screen-phosphor: #66c275;
+  --text-main: #2b2825;
+  --text-muted: #7a766f;
+  --text-faint: #9d988f;
+  --shadow-engraved: inset 0 1px 0 rgba(255, 255, 255, 0.82), 0 1px 0 rgba(0, 0, 0, 0.08);
+  --shadow-panel: 0 10px 30px rgba(43, 40, 37, 0.14);
+  --radius: 4px;
+  --radius-sm: 3px;
+}
+
+/* 暗色模式：host 通过 postMessage 把当前主题推过来，document.documentElement
+   设上 data-theme="dark" 后这里变量重定义。配色与 host 暗皮一致（深炭风） */
+[data-theme='dark'] {
+  --bg-canvas: #1A1B1E;
+  --bg-panel: #232529;
+  --bg-control: #2A2C30;
+  --bg-metal: #1F2024;
+  --bg-press: #303236;
+  --border-main: #383A3F;
+  --border-dark: #4E5158;
+  --atomic-teal: #4FB1AE;
+  --nuka-red: #DD5C4E;
+  --vault-gold: #E3B254;
+  --bakelite-dark: #E8E4DC;
+  --screen-bg: #11181A;
+  --screen-phosphor: #6FD482;
+  --text-main: #E8E4DC;
+  --text-muted: #A09A8E;
+  --text-faint: #6A6862;
+  --shadow-engraved: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 1px 0 rgba(0, 0, 0, 0.5);
+  --shadow-panel: 0 10px 30px rgba(0, 0, 0, 0.6);
+}
+
+/* 主题切换：iframe 也用 View Transitions API（document.startViewTransition）
+   做合成器层交叉淡入。之前 * 选择器全局 transition 性能崩坏已废弃 */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 360ms;
+  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 钢琴卷帘里硬编码的浅色背景：暗模式针对性反相
+   这些色值在 voice-runtime.css 各处写死，没走变量——单独覆盖 */
+[data-theme='dark'] #toolbar {
+  background: var(--bg-panel);
+}
+[data-theme='dark'] #toolbar::after {
+  background: rgba(255, 255, 255, 0.04);
+}
+[data-theme='dark'] #toolbar button {
+  background: linear-gradient(180deg, var(--bg-control) 0%, var(--bg-press) 100%);
+  color: var(--text-main);
+  border-color: var(--border-dark);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+[data-theme='dark'] #toolbar button:hover {
+  background: var(--bg-press);
+  border-color: var(--atomic-teal);
+}
+
+/* 钢琴卷帘上方的浮动工具栏（音符 / 歌词 / 音高 / 快速填词 / 将该轨道渲染为人声 ...）*/
+[data-theme='dark'] .piano-roll-editor-toolbar--floating {
+  background: rgba(35, 37, 41, 0.92);
+  border-color: var(--border-dark);
+  box-shadow: 0 10px 18px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+[data-theme='dark'] .piano-roll-editor-mode-group {
+  border-right-color: rgba(160, 154, 142, 0.25);
+}
+[data-theme='dark'] .piano-roll-editor-property-group {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(160, 154, 142, 0.25);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+[data-theme='dark'] .piano-roll-editor-property-title {
+  background: rgba(232, 228, 220, 0.08);
+  color: var(--text-main);
+}
+[data-theme='dark'] .piano-roll-editor-number {
+  color: var(--text-muted);
+}
+
+/* 工具栏按钮：默认态 / hover / active / disabled 全套
+   关键：disabled 文字必须保持可读——之前 text-faint 在浅底上灰糊一团，
+   现在底变深，配套用更浅的灰让用户能看清"哪个按钮是禁用的，写着什么字" */
+[data-theme='dark'] .piano-roll-editor-btn {
+  background: linear-gradient(180deg, var(--bg-control) 0%, var(--bg-press) 100%);
+  color: var(--text-main);
+  border-color: var(--border-dark);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+[data-theme='dark'] .piano-roll-editor-btn:hover:not(:disabled) {
+  background: var(--bg-press);
+  border-color: var(--atomic-teal);
+}
+[data-theme='dark'] .piano-roll-editor-btn.active {
+  background: linear-gradient(180deg, var(--atomic-teal) 0%, #3A8E8B 100%);
+  border-color: rgba(0, 0, 0, 0.4);
+  color: #FFF;
+}
+[data-theme='dark'] .piano-roll-editor-btn:disabled {
+  background: linear-gradient(180deg, var(--bg-panel) 0%, var(--bg-metal) 100%);
+  border-color: rgba(160, 154, 142, 0.25);
+  /* 用 text-muted 而不是 text-faint——禁用按钮的字也要让用户看得清 */
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+/* 钢琴卷帘下方按钮 / 提示 */
+[data-theme='dark'] .piano-roll-editor-hint {
+  color: var(--text-muted);
+}
+[data-theme='dark'] .lyric-edit-input,
+[data-theme='dark'] .lyric-dialog-input {
+  background: var(--bg-control);
+  color: var(--text-main);
+  border-color: var(--atomic-teal);
+}
+[data-theme='dark'] .context-menu,
+[data-theme='dark'] .lyric-dialog {
+  background: var(--bg-panel);
+  border-color: var(--border-dark);
+  color: var(--text-main);
+  box-shadow: var(--shadow-panel), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+/* scrollbar */
+[data-theme='dark'] ::-webkit-scrollbar-thumb {
+  background: var(--border-dark);
+  border-color: var(--bg-canvas);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--bg-panel);
+  color: var(--text-main);
+  font: 11px "Inter", "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-canvas);
+  border-left: 1px solid var(--border-main);
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c4c0b6;
+  border: 2px solid var(--bg-canvas);
+  border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--atomic-teal);
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-canvas);
+}
+
+#toolbar {
+  position: relative;
+  flex: 0 0 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-dark);
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.03);
+  z-index: 10;
+}
+
+#toolbar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -2px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.82);
+  pointer-events: none;
+}
+
+#toolbar button {
+  min-width: 78px;
+  height: 26px;
+  padding: 0 12px;
+  border: 1px solid var(--border-dark);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, #ffffff 0%, #f0ede5 100%);
+  color: var(--text-main);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), inset 0 1px 0 rgba(255, 255, 255, 1);
+  transition: background 0.12s ease, transform 0.05s ease, border-color 0.12s ease;
+}
+
+#toolbar button:hover {
+  background: #e8e5df;
+  border-color: var(--border-dark);
+}
+
+#toolbar button:active {
+  transform: translateY(1px);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+#piano-roll-container {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  overflow: hidden;
+  background: var(--bg-canvas);
+}
+
+.piano-roll-keyboard {
+  flex-shrink: 0;
+  background: linear-gradient(180deg, #f6f3ed 0%, #ebe6db 100%);
+  border-right: 1px solid var(--border-dark);
+  box-shadow: 2px 0 4px rgba(0, 0, 0, 0.03);
+}
+
+.piano-roll-canvas-wrapper {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-canvas);
+}
+
+/* 按住 H 临时抓手：光标提前反馈 */
+.piano-roll-canvas-wrapper.piano-roll-pan-override {
+  cursor: grab;
+}
+
+/* 实际拖动中：握拳光标 */
+.piano-roll-canvas-wrapper.piano-roll-panning {
+  cursor: grabbing;
+}
+
+.piano-roll-editor-toolbar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 20px);
+}
+
+.piano-roll-editor-toolbar--floating {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 20;
+  padding: 6px 8px;
+  border: 1px solid rgba(163, 160, 151, 0.82);
+  border-radius: 999px;
+  background: rgba(244, 242, 236, 0.92);
+  box-shadow: 0 10px 18px rgba(43, 40, 37, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.88);
+  backdrop-filter: blur(10px);
+}
+
+.piano-roll-editor-mode-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 6px;
+  margin-right: 2px;
+  border-right: 1px solid rgba(163, 160, 151, 0.55);
+}
+
+.piano-roll-editor-control-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.piano-roll-editor-property-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid rgba(163, 160, 151, 0.52);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78);
+}
+
+.piano-roll-editor-property-title {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(43, 40, 37, 0.08);
+  color: var(--text-main);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.piano-roll-editor-vibrato-group {
+  gap: 6px;
+}
+
+.piano-roll-editor-number {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 2px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.piano-roll-editor-number-label {
+  min-width: 10px;
+}
+
+.piano-roll-editor-number-input {
+  width: 54px;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid rgba(163, 160, 151, 0.72);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--text-main);
+  font: 600 11px/1 "JetBrains Mono", monospace;
+}
+
+.piano-roll-editor-select {
+  min-width: 108px;
+  height: 24px;
+  padding: 0 24px 0 8px;
+  border: 1px solid rgba(163, 160, 151, 0.72);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--text-main);
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  outline: none;
+}
+
+.piano-roll-editor-number-input:disabled {
+  color: var(--text-faint);
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.piano-roll-editor-select:disabled {
+  color: var(--text-faint);
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.piano-roll-editor-btn {
+  min-width: 58px;
+  height: 26px;
+  padding: 0 11px;
+  border: 1px solid var(--border-dark);
+  border-radius: 999px;
+  background: linear-gradient(180deg, #ffffff 0%, #efe9dd 100%);
+  color: var(--text-main);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  transition: transform 0.08s ease, border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.piano-roll-editor-btn:hover:not(:disabled) {
+  border-color: var(--atomic-teal);
+  background: #f1ece1;
+}
+
+.piano-roll-editor-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.piano-roll-editor-btn.active {
+  border-color: rgba(59, 139, 136, 0.92);
+  background: linear-gradient(180deg, rgba(59, 139, 136, 0.96) 0%, rgba(47, 117, 114, 0.96) 100%);
+  color: #f7f2e8;
+}
+
+.piano-roll-editor-btn:disabled {
+  cursor: default;
+  color: var(--text-faint);
+  border-color: rgba(163, 160, 151, 0.6);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.8) 0%, rgba(236, 231, 221, 0.8) 100%);
+}
+
+.piano-roll-editor-btn--secondary {
+  min-width: 74px;
+}
+
+.piano-roll-editor-btn--compact {
+  min-width: 48px;
+  padding: 0 9px;
+}
+
+.piano-roll-editor-hint {
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.piano-roll-time-ruler {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 5;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-dark);
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78);
+}
+
+.piano-roll-grid,
+.piano-roll-notes {
+  position: absolute;
+  top: 24px;
+  left: 0;
+}
+
+.piano-roll-notes {
+  pointer-events: none;
+}
+
+.piano-roll-phoneme-timing {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  z-index: 6;
+  pointer-events: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
+}
+
+.lyric-edit-input,
+.lyric-dialog-input {
+  background: var(--bg-control);
+  color: var(--text-main);
+  border: 1px solid var(--atomic-teal);
+  outline: none;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.lyric-edit-input {
+  position: absolute;
+  z-index: 100;
+  min-width: 34px;
+  max-width: 140px;
+  padding: 2px 5px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+}
+
+.context-menu,
+.lyric-dialog {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-dark);
+  color: var(--text-main);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-panel), inset 0 1px 0 rgba(255, 255, 255, 0.88);
+}
+
+.context-menu {
+  position: absolute;
+  z-index: 200;
+  min-width: 128px;
+  padding: 4px 0;
+}
+
+.context-menu-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 199;
+}
+
+.context-menu-item {
+  padding: 7px 16px;
+  color: var(--text-main);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+
+.context-menu-item:hover {
+  background: var(--atomic-teal);
+  color: #fff;
+}
+
+.lyric-dialog {
+  position: absolute;
+  z-index: 200;
+  top: 50%;
+  left: 50%;
+  min-width: 300px;
+  padding: 16px;
+  transform: translate(-50%, -50%);
+}
+
+.lyric-dialog-title {
+  margin-bottom: 8px;
+  color: var(--text-main);
+  font-family: "Oswald", sans-serif;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.lyric-dialog-input {
+  width: 100%;
+  padding: 7px 9px;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+}
+
+.lyric-dialog-hint {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+#playhead {
+  position: absolute;
+  top: 24px;
+  left: 0;
+  z-index: 10;
+  width: 16px;
+  margin-left: -8px;
+  height: calc(100% - 24px);
+  background: rgba(201, 66, 52, 0.001);
+  cursor: col-resize;
+  pointer-events: auto;
+  touch-action: none;
+  will-change: transform;
+  transform: translateX(0);
+  backface-visibility: hidden;
+}
+
+#playhead:hover {
+  background: rgba(201, 66, 52, 0.08);
+}
+
+#playhead::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 8px;
+  width: 1px;
+  background: var(--nuka-red);
+}
+
+#playhead::after {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  background: var(--nuka-red);
+  clip-path: polygon(0 0, 100% 0, 50% 100%);
+}
+
+#playhead.playhead--waiting {
+  animation: playhead-pulse 0.8s infinite;
+}
+
+#playhead.playhead--waiting:hover {
+  background: rgba(212, 160, 53, 0.1);
+}
+
+#playhead.playhead--waiting::before,
+#playhead.playhead--waiting::after {
+  background: var(--vault-gold);
+}
+
+@keyframes playhead-pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.35; }
+  100% { opacity: 1; }
+}
+
+/* Track selector overlay */
+#track-selector-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(43, 40, 37, 0.45);
+  backdrop-filter: blur(4px);
+}
+
+.track-selector-card {
+  width: min(400px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-panel), inset 0 1px 0 rgba(255, 255, 255, 0.88);
+  border: 1px solid var(--border-dark);
+  background: var(--bg-panel);
+  color: var(--text-main);
+  padding: 20px;
+}
+
+.track-selector-title {
+  margin: 0 0 12px;
+  font-family: "Oswald", sans-serif;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.track-selector-tempo {
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-metal);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.tempo-info {
+  display: block;
+  color: var(--text-main);
+}
+
+.tempo-sync-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.track-selector-language {
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-metal);
+  border-radius: var(--radius-sm);
+}
+
+.track-selector-language-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-main);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.track-selector-language-select {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border-dark);
+  border-radius: var(--radius-sm);
+  background: var(--bg-control);
+  color: var(--text-main);
+  font-size: 12px;
+}
+
+.track-selector-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.track-option {
+  width: 100%;
+  border: 1px solid var(--border-dark);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, #ffffff 0%, #f0ede5 100%);
+  color: var(--text-main);
+  cursor: pointer;
+  text-align: left;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), inset 0 1px 0 rgba(255, 255, 255, 1);
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.track-option:hover {
+  background: var(--bg-press);
+  border-color: var(--atomic-teal);
+}
+
+.track-option:active {
+  transform: translateY(1px);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+#status-bar {
+  flex: 0 0 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border-dark);
+  color: var(--text-muted);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.82);
+}
+
+.prepare-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(43, 40, 37, 0.45);
+  backdrop-filter: blur(4px);
+}
+
+.prepare-overlay-content {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 20px 28px;
+  border: 1px solid var(--border-dark);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  color: var(--text-main);
+  box-shadow: var(--shadow-panel), inset 0 1px 0 rgba(255, 255, 255, 0.88);
+}
+
+.prepare-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border-main);
+  border-top-color: var(--atomic-teal);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.prepare-text {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+body.runtime-embedded {
+  background: var(--bg-canvas);
+}
+
+body.runtime-embedded #toolbar,
+body.runtime-embedded #status-bar,
+body.runtime-embedded #btn-import {
+  display: none;
+}

@@ -1,0 +1,133 @@
+import { LANGUAGE_OPTIONS, normalizeOptionalLanguageCode } from '../../config/languageOptions.js'
+import { fetchVoicebanks, getDefaultSingerId } from '../../api/VoicebankApi.js'
+import { onLocaleChange, t as i18nT } from '../../i18n/index.js'
+
+// 把后端 VoicebankInfo.singerType (DiffSinger / Classic / ...) 映射成下拉框里的简短标注
+function formatSingerTypeTag(singerType) {
+  if (!singerType) return ''
+  const lower = String(singerType).toLowerCase()
+  if (lower === 'diffsinger') return i18nT('voicebank.diffsinger_tag')
+  if (lower === 'classic') return i18nT('voicebank.classic_tag')
+  return `[${singerType}]`
+}
+
+function getRefs() {
+  return {
+    overlay: document.getElementById('track-language-modal'),
+    title: document.getElementById('track-language-title'),
+    hint: document.getElementById('track-language-hint'),
+    select: document.getElementById('track-language-select'),
+    voicebankSelect: document.getElementById('track-voicebank-select'),
+    btnCancel: document.getElementById('btn-track-language-cancel'),
+    btnConfirm: document.getElementById('btn-track-language-confirm'),
+  }
+}
+
+export class TrackLanguageModal {
+  constructor() {
+    this.refs = getRefs()
+    this.pendingResolve = null
+    this._voicebanksLoaded = false
+  }
+
+  init() {
+    this._renderOptions()
+    this._bindEvents()
+    onLocaleChange(() => {
+      // 重渲选项文案 + 兜底标签
+      this._renderOptions()
+      if (this.refs.btnCancel) this.refs.btnCancel.textContent = i18nT('modal.language.cancel')
+    })
+  }
+
+  async prompt(trackName, languageCode, options = {}) {
+    if (!this.refs.overlay || !this.refs.select) return null
+    if (this.pendingResolve) this.pendingResolve(null)
+
+    const normalizedCode = normalizeOptionalLanguageCode(languageCode) || ''
+    this.refs.title.textContent = options.title || i18nT('modal.language.title_for', { name: trackName })
+    this.refs.hint.textContent = options.hint || i18nT('modal.language.hint')
+    this.refs.select.value = normalizedCode
+    this.refs.btnConfirm.textContent = options.actionLabel || i18nT('modal.language.continue')
+    if (this.refs.btnCancel) this.refs.btnCancel.textContent = i18nT('modal.language.cancel')
+    this._updateConfirmState()
+
+    await this._loadVoicebanks(options.singerId)
+
+    this.refs.overlay.classList.add('is-open')
+    document.body.classList.add('modal-open')
+    queueMicrotask(() => this.refs.select?.focus())
+
+    return new Promise((resolve) => {
+      this.pendingResolve = resolve
+    })
+  }
+
+  async _loadVoicebanks(currentSingerId) {
+    const select = this.refs.voicebankSelect
+    if (!select) return
+    try {
+      const voicebanks = await fetchVoicebanks()
+      select.innerHTML = ''
+      voicebanks.forEach((vb) => {
+        const option = document.createElement('option')
+        option.value = vb.id
+        // 在名称后附带音源类型标记，帮助用户区分：
+        //   DiffSinger：自动音高预测
+        //   Classic：UTAU 声库，需手画音高
+        const typeTag = formatSingerTypeTag(vb.singerType)
+        option.textContent = typeTag ? `${vb.name || vb.id}  ${typeTag}` : (vb.name || vb.id)
+        if (vb.singerType) option.dataset.singerType = vb.singerType
+        select.appendChild(option)
+      })
+      if (currentSingerId && voicebanks.some((vb) => vb.id === currentSingerId)) {
+        select.value = currentSingerId
+      } else {
+        select.value = getDefaultSingerId(voicebanks) || ''
+      }
+      this._voicebanksLoaded = true
+    } catch {
+      select.innerHTML = `<option value="">${i18nT('modal.language.voicebank_load_failed')}</option>`
+      this._voicebanksLoaded = false
+    }
+    this._updateConfirmState()
+  }
+
+  _renderOptions() {
+    if (!this.refs.select) return
+    this.refs.select.innerHTML = `<option value="">${i18nT('modal.language.please_choose')}</option>`
+    LANGUAGE_OPTIONS.forEach((option) => {
+      const element = document.createElement('option')
+      element.value = option.code
+      element.textContent = `${option.label} (${option.code})`
+      this.refs.select.appendChild(element)
+    })
+  }
+
+  _updateConfirmState() {
+    const hasLanguage = Boolean(normalizeOptionalLanguageCode(this.refs.select?.value))
+    const hasSinger = Boolean(this.refs.voicebankSelect?.value)
+    this.refs.btnConfirm.disabled = !(hasLanguage && hasSinger)
+  }
+
+  _bindEvents() {
+    this.refs.select?.addEventListener('change', () => this._updateConfirmState())
+    this.refs.voicebankSelect?.addEventListener('change', () => this._updateConfirmState())
+    this.refs.btnCancel?.addEventListener('click', () => this._close(null))
+    this.refs.btnConfirm?.addEventListener('click', () => {
+      const code = normalizeOptionalLanguageCode(this.refs.select.value)
+      if (!code) return
+      const singerId = this.refs.voicebankSelect?.value || null
+      this._close({ languageCode: code, singerId })
+    })
+  }
+
+  _close(result) {
+    if (!this.pendingResolve) return
+    this.refs.overlay?.classList.remove('is-open')
+    document.body.classList.remove('modal-open')
+    const resolve = this.pendingResolve
+    this.pendingResolve = null
+    resolve(result)
+  }
+}

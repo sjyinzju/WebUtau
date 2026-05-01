@@ -1,0 +1,186 @@
+import eventBus from '../../core/EventBus.js'
+import phraseStore from '../../core/PhraseStore.js'
+import playheadController from '../../modules/PlayheadController.js'
+import { EVENTS } from '../../config/constants.js'
+import phraseRenderStateStore from './phraseRenderStateStore.js'
+import { buildRuntimeSnapshot } from './runtimeSnapshot.js'
+import { t } from '../../i18n/index.js'
+
+export function createRuntimeEventBindings({
+  callbacks,
+  embedded,
+  state,
+  setStatus,
+  buildPlaybackPayload,
+  buildSeekPayload,
+  emitPlaybackState,
+}) {
+  let pendingManifestSyncFrame = 0
+  let pendingManifestSyncReason = null
+
+  function buildLivePhraseStates() {
+    return (phraseStore.getPhrases() || []).map((phrase, index) => {
+      const phraseIndex = Number.isInteger(phrase?.index) ? phrase.index : index
+      const timeInfo = phraseRenderStateStore.getTimeInfo(phraseIndex)
+      const startMs = Number.isFinite(timeInfo?.startMs)
+        ? timeInfo.startMs
+        : (Number.isFinite(phrase?.startTime) ? phrase.startTime * 1000 : null)
+      const durationMs = Number.isFinite(timeInfo?.durationMs)
+        ? timeInfo.durationMs
+        : (
+            Number.isFinite(phrase?.startTime) && Number.isFinite(phrase?.endTime)
+              ? Math.max(50, (phrase.endTime - phrase.startTime) * 1000)
+              : null
+          )
+      return {
+        phraseIndex,
+        inputHash: phrase?.inputHash || null,
+        startMs,
+        durationMs,
+        status: phraseRenderStateStore.getStatus(phraseIndex),
+      }
+    })
+  }
+
+  function flushLiveRenderManifestSync() {
+    pendingManifestSyncFrame = 0
+    const reason = pendingManifestSyncReason || 'runtime-cache'
+    pendingManifestSyncReason = null
+    const trackId = state.trackId
+    if (!trackId) return
+    callbacks.onRenderManifestSync?.({
+      trackId,
+      jobId: phraseStore.getJobId(),
+      status: 'rendering',
+      hasPredictedPitch: Boolean(phraseStore.getPitchData()),
+      phraseStates: buildLivePhraseStates(),
+      source: reason,
+    })
+  }
+
+  function scheduleLiveRenderManifestSync(reason = 'runtime-cache') {
+    pendingManifestSyncReason = reason
+    if (pendingManifestSyncFrame) return
+    pendingManifestSyncFrame = requestAnimationFrame(() => {
+      flushLiveRenderManifestSync()
+    })
+  }
+
+  function handlePhraseRebuilt({ phrases }) {
+    setStatus(t('voiceRuntime.phrase_done', { count: phrases.length }))
+  }
+
+  function handleTransportTick({ time }) {
+    if (embedded) return
+    callbacks.onPlaybackTick?.(buildPlaybackPayload(time))
+  }
+
+  function handleTransportSeek({ time }) {
+    if (embedded) {
+      callbacks.onSeekRequested?.(buildSeekPayload(time))
+      return
+    }
+    callbacks.onPlaybackTick?.(buildPlaybackPayload(time))
+  }
+
+  function handleTransportStateChange({ time } = {}) {
+    if (embedded) return
+    emitPlaybackState(Number.isFinite(time) ? time : playheadController.getPosition())
+  }
+
+  function handleJobSubmitted({ jobId }) {
+    callbacks.onJobSubmitted?.({
+      trackId: state.trackId,
+      jobId: jobId || phraseStore.getJobId() || null,
+    })
+  }
+
+  function handlePitchLoaded() {
+    setStatus(t('voiceRuntime.pitch_predicted', { name: state.trackName }))
+    callbacks.onPredictionReady?.(buildRuntimeSnapshot(state, phraseStore))
+  }
+
+  function handleJobProgress(payload = {}) {
+    const { completed, total, status, progress, phrases = [] } = payload
+    const jobId = phraseStore.getJobId()
+    if (state.trackId) {
+      callbacks.onRenderManifestSync?.({
+        trackId: state.trackId,
+        jobId,
+        status,
+        hasPredictedPitch: Boolean(phraseStore.getPitchData()),
+        phraseStates: phrases.map((phraseInfo) => ({
+          phraseIndex: phraseInfo.index,
+          inputHash: phraseStore.getPhrase(phraseInfo.index)?.inputHash || null,
+          startMs: phraseInfo.startMs,
+          durationMs: phraseInfo.durationMs,
+          status: phraseInfo.status,
+        })),
+      })
+    }
+    if (status === 'completed') {
+      setStatus(t('voiceRuntime.render_done'))
+      callbacks.onRenderComplete?.(buildRuntimeSnapshot(state, phraseStore))
+      return
+    }
+    setStatus(progress || t('voiceRuntime.rendering', { done: completed, total }))
+    callbacks.onRenderProgress?.({
+      trackId: state.trackId,
+      jobId,
+      completed,
+      total,
+      status,
+      progress,
+    })
+  }
+
+  function handleJobFailed({ error }) {
+    setStatus(t('voiceRuntime.render_failed', { error: error || t('hostStatus.unknown_error') }))
+    emitPlaybackState()
+    callbacks.onRenderFailed?.({
+      trackId: state.trackId,
+      jobId: phraseStore.getJobId(),
+      error: error || '未知错误',
+    })
+  }
+
+  function handleCacheInvalidated() {
+    if (!state.trackId) return
+    scheduleLiveRenderManifestSync('runtime-cache')
+  }
+
+  function handlePhraseReady(payload = {}) {
+    if (state.trackId == null || !Number.isInteger(payload.phraseIndex)) return
+    const phrase = phraseStore.getPhrase(payload.phraseIndex)
+    console.log('[RuntimeSession] Runtime phrase ready bridged', {
+      trackId: state.trackId,
+      phraseIndex: payload.phraseIndex,
+      startMs: payload.startMs,
+      durationMs: payload.durationMs,
+    })
+    callbacks.onPhraseReady?.({
+      trackId: state.trackId,
+      jobId: phraseStore.getJobId(),
+      phraseIndex: payload.phraseIndex,
+      inputHash: payload.inputHash || phrase?.inputHash || null,
+      startMs: payload.startMs,
+      durationMs: payload.durationMs,
+    })
+  }
+
+  return function bindRuntimeEvents(notifyDirty) {
+    eventBus.on(EVENTS.PHRASES_REBUILT, handlePhraseRebuilt)
+    eventBus.on(EVENTS.PHRASES_EDITED, notifyDirty)
+    eventBus.on(EVENTS.TRANSPORT_PLAY, handleTransportStateChange)
+    eventBus.on(EVENTS.TRANSPORT_PAUSE, handleTransportStateChange)
+    eventBus.on(EVENTS.TRANSPORT_SEEK_UPDATE, handleTransportStateChange)
+    eventBus.on(EVENTS.TRANSPORT_TICK, handleTransportTick)
+    eventBus.on(EVENTS.TRANSPORT_SEEK, handleTransportSeek)
+    eventBus.on(EVENTS.JOB_SUBMITTED, handleJobSubmitted)
+    eventBus.on(EVENTS.PITCH_LOADED, handlePitchLoaded)
+    eventBus.on(EVENTS.JOB_PROGRESS, handleJobProgress)
+    eventBus.on(EVENTS.JOB_FAILED, handleJobFailed)
+    eventBus.on(EVENTS.CACHE_INVALIDATED, handleCacheInvalidated)
+    eventBus.on(EVENTS.RENDER_COMPLETE, handlePhraseReady)
+  }
+}

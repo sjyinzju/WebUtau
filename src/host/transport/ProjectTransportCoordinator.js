@@ -1,0 +1,595 @@
+﻿import { resolveAudibleTrackIds } from '../monitor/TrackAudibilityResolver.js'
+import { t } from '../../i18n/index.js'
+import { normalizeTrackVolume } from '../project/trackPlaybackState.js'
+import { getProjectDuration } from '../services/PreviewProjector.js'
+import { TrackFxDispatchRouter } from './TrackFxDispatchRouter.js'
+
+const HOST_PROJECT_DRIVER = 'host-project'
+const HOST_RECORD_DRIVER = 'host-record'
+
+function formatTransportTime(timeSec) {
+  const safeTime = Math.max(0, Number.isFinite(timeSec) ? timeSec : 0)
+  const minutes = Math.floor(safeTime / 60)
+  const seconds = Math.floor(safeTime % 60)
+  const milliseconds = Math.floor((safeTime - Math.floor(safeTime)) * 1000)
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`
+}
+
+export class ProjectTransportCoordinator {
+  constructor({
+    projectStore,
+    sessionStore,
+    transportStore,
+    audioGraph = null,
+    instrumentScheduler,
+    importedAudioScheduler = null,
+    vocalScheduler,
+    convertedVocalScheduler,
+    runtimeTransportSync = null,
+    view,
+    logger = null,
+    onPlaybackEndedNaturally = null,
+  }) {
+    this.projectStore = projectStore
+    this.sessionStore = sessionStore
+    this.transportStore = transportStore
+    this.audioGraph = audioGraph
+    this.instrumentScheduler = instrumentScheduler
+    this.importedAudioScheduler = importedAudioScheduler
+    this.vocalScheduler = vocalScheduler
+    this.convertedVocalScheduler = convertedVocalScheduler
+    this.trackFxDispatchRouter = new TrackFxDispatchRouter({
+      projectStore,
+      instrumentScheduler,
+      importedAudioScheduler,
+      vocalScheduler,
+      convertedVocalScheduler,
+    })
+    this.runtimeTransportSync = runtimeTransportSync
+    this.view = view
+    this.logger = logger
+    // 跟"用户暂停 / 用户停止"区分开——只在工程播放跑到末尾时触发，
+    // 给 LUFS 自动达标这种"必须完整测一遍"的功能用
+    this.onPlaybackEndedNaturally = onPlaybackEndedNaturally
+    this.rafId = null
+    this.clockStartedAtMs = 0
+    this.clockStartedSongTime = 0
+    this.refreshToken = 0
+    this.lastTransportDisplayAtMs = 0
+    this.lastFrameTraceAtMs = 0
+    this.lastViewTickTraceAtMs = 0
+    this.lastMissingChunkToastAt = 0
+    this._missingChunkUnsubscribe = null
+  }
+
+  init() {
+    this._syncViewState(this.transportStore.getSnapshot())
+    // 注册 "触发 note 时所在 chunk 未加载完成" 事件 → 右上角 toast
+    const samplerPool = this.instrumentScheduler?.samplerPool
+    if (samplerPool?.onMissingSample) {
+      this._missingChunkUnsubscribe = samplerPool.onMissingSample(() => this._handleMissingChunk())
+    }
+  }
+
+  _handleMissingChunk() {
+    if (!this.isProjectPlaybackActive()) return
+    const now = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now()
+      : Date.now()
+    // debounce：1 秒内只弹一次（避免同一 chunk 内多 note 连续触发多次 toast）
+    if (now - this.lastMissingChunkToastAt < 1000) return
+    this.lastMissingChunkToastAt = now
+    this.view?.showPlaybackToast?.('音频加载中，当前段落可能出现音色偏色…', {
+      tone: 'warning',
+      toastId: 'chunk-loading',
+      durationMs: 2400,
+    })
+  }
+
+  getSnapshot() {
+    return this.transportStore.getSnapshot()
+  }
+
+  isTransportActive() {
+    return Boolean(this.transportStore.getSnapshot().playing)
+  }
+
+  isProjectPlaybackActive() {
+    const snapshot = this.transportStore.getSnapshot()
+    return snapshot.playing && snapshot.driver === HOST_PROJECT_DRIVER
+  }
+
+  isRecordClockActive() {
+    const snapshot = this.transportStore.getSnapshot()
+    return snapshot.playing && snapshot.driver === HOST_RECORD_DRIVER
+  }
+
+  async toggleProjectPlayback() {
+    this._logTrace('toggleProjectPlayback:entry')
+    if (this.isTransportActive()) {
+      this._logTrace('toggleProjectPlayback:pause-branch')
+      this.pause()
+      return true
+    }
+
+    const project = this.projectStore.getProject()
+    if (!project) {
+      this._logTrace('toggleProjectPlayback:no-project')
+      this.view.setStatus(t('hostStatus.import_midi_first'))
+      return false
+    }
+
+    this.view.setStatus(t('hostStatus.loading_project'))
+    this.view.showPlaybackToast?.('正在准备播放资源，请稍候… 受网络环境影响，此过程可能较慢。', {
+      tone: 'preparing',
+      durationMs: 0,
+      toastId: 'preparing-playback',
+    })
+    const currentTime = this.transportStore.getSnapshot().currentTime || 0
+    this._logTrace('toggleProjectPlayback:start-request', { requestedTime: currentTime })
+    return this._startProjectPlaybackFromTime(currentTime, 'play')
+  }
+
+  async refreshProjectPlayback(reason = 'transport-refresh') {
+    if (!this.isProjectPlaybackActive()) return false
+    return this._startProjectPlaybackFromTime(this._getCurrentSongTime(), reason)
+  }
+
+  setTrackVolume(trackId, volume) {
+    const nextVolume = normalizeTrackVolume(volume)
+    return this.trackFxDispatchRouter.dispatch(trackId, 'setTrackVolume', nextVolume)
+  }
+
+  setTrackPan(trackId, pan) {
+    // pan 不需要走 scheduler 维护的 per-track 状态——它纯粹是 audioGraph
+    // channel 的路由层节点。直接调 audioGraph 比给每个 scheduler 加重复的 delegate 简洁
+    return Boolean(this.audioGraph?.setTrackPan?.(trackId, pan))
+  }
+
+  setTrackReverbSend(trackId, reverbSend) {
+    return this.trackFxDispatchRouter.dispatch(trackId, 'setTrackReverbSend', reverbSend)
+  }
+
+  setTrackReverbConfig(trackId, reverbConfig) {
+    return this.trackFxDispatchRouter.dispatch(trackId, 'setTrackReverbConfig', reverbConfig)
+  }
+
+  setTrackGuitarTone(trackId, guitarTone) {
+    return this.trackFxDispatchRouter.dispatch(trackId, 'setTrackGuitarTone', guitarTone)
+  }
+
+  pause() {
+    const snapshot = this.transportStore.getSnapshot()
+    this._logTrace('pause:entry')
+    if (!snapshot.playing) return snapshot
+
+    const currentTime = this._getCurrentSongTime()
+    this._cancelFrame()
+    this.instrumentScheduler.stop()
+    this.importedAudioScheduler?.stop?.()
+    this.vocalScheduler.stop()
+    this.convertedVocalScheduler?.stop?.()
+    const nextSnapshot = this.transportStore.patch({
+      playing: false,
+      currentTime,
+      duration: Math.max(snapshot.duration || 0, currentTime),
+    })
+    this._syncViewState(nextSnapshot)
+    this.view.setStatus(snapshot.driver === HOST_RECORD_DRIVER ? '已暂停录制定位' : '已暂停项目预览')
+    this._logTrace('pause:completed', {
+      pausedAt: currentTime,
+    })
+    return nextSnapshot
+  }
+
+  reset() {
+    this.refreshToken += 1
+    this._cancelFrame()
+    this.instrumentScheduler.stop()
+    this.importedAudioScheduler?.stop?.()
+    this.vocalScheduler.stop()
+    this.convertedVocalScheduler?.stop?.()
+    const snapshot = this.transportStore.reset()
+    this._syncViewState(snapshot)
+    return snapshot
+  }
+
+  async seekToTime(timeSec) {
+    const project = this.projectStore.getProject()
+    if (!project) return false
+
+    const snapshot = this.transportStore.getSnapshot()
+    const duration = Math.max(snapshot.duration || 0, getProjectDuration(project.tracks))
+    const targetTime = Math.min(Math.max(0, Number.isFinite(timeSec) ? timeSec : 0), duration)
+    this._logTrace('seekToTime:entry', {
+      requestedTime: timeSec,
+      targetTime,
+    })
+
+    if (this.isProjectPlaybackActive()) {
+      this._logTrace('seekToTime:restart-project-playback', { targetTime })
+      return this._startProjectPlaybackFromTime(targetTime, 'seek')
+    }
+
+    if (this.isRecordClockActive()) {
+      this.clockStartedAtMs = performance.now()
+      this.clockStartedSongTime = targetTime
+      const nextSnapshot = this.transportStore.patch({
+        currentTime: targetTime,
+        duration: Math.max(duration, targetTime),
+      })
+      this._syncViewState(nextSnapshot)
+      this.logger?.info?.('宿主录制时钟定位完成', {
+        driver: snapshot.driver,
+        playing: snapshot.playing,
+        currentTime: targetTime,
+      })
+      this._logTrace('seekToTime:record-clock-updated', { targetTime })
+      return true
+    }
+
+    const nextSnapshot = this.transportStore.patch({
+      currentTime: targetTime,
+      duration,
+    })
+    this._syncViewState(nextSnapshot)
+    this.logger?.info?.('宿主定位完成', {
+      driver: snapshot.driver,
+      playing: snapshot.playing,
+      currentTime: targetTime,
+    })
+    this._logTrace('seekToTime:completed', { targetTime })
+    return true
+  }
+
+  isInstrumentPlaybackActive() {
+    return this.isProjectPlaybackActive()
+  }
+
+  startRecordClock(currentTime = null) {
+    const snapshot = this.transportStore.getSnapshot()
+    const project = this.projectStore.getProject()
+    const targetTime = Number.isFinite(currentTime)
+      ? Math.max(0, currentTime)
+      : Math.max(0, snapshot.currentTime || 0)
+    const duration = Math.max(snapshot.duration || 0, getProjectDuration(project?.tracks || []), targetTime)
+
+    this.refreshToken += 1
+    this._cancelFrame()
+    this.instrumentScheduler.stop()
+    this.importedAudioScheduler?.stop?.()
+    this.vocalScheduler.stop()
+    this.convertedVocalScheduler?.stop?.()
+    this.transportStore.replace({
+      driver: HOST_RECORD_DRIVER,
+      playing: true,
+      currentTime: targetTime,
+      duration,
+    })
+    this.clockStartedAtMs = performance.now()
+    this.clockStartedSongTime = targetTime
+    this._scheduleFrame()
+    this._syncViewState(this.transportStore.getSnapshot())
+    this.view.setStatus(t('hostStatus.midi_record_started'))
+    this.logger?.info?.('宿主录制时钟已启动', {
+      currentTime: targetTime,
+      duration,
+    })
+    return true
+  }
+
+  _scheduleFrame() {
+    this._cancelFrame()
+    this._logTrace('scheduleFrame:armed')
+    const tick = () => {
+      const snapshot = this.transportStore.getSnapshot()
+      if (!snapshot.playing) return
+
+      const currentTime = this._getCurrentSongTime()
+      const now = performance.now()
+      if (now - this.lastFrameTraceAtMs >= 250) {
+        this.lastFrameTraceAtMs = now
+        this._logTrace('scheduleFrame:tick', {
+          computedCurrentTime: currentTime,
+          driver: snapshot.driver,
+        })
+      }
+
+      if (snapshot.driver === HOST_PROJECT_DRIVER) {
+        const clampedTime = Math.min(currentTime, snapshot.duration || currentTime)
+        this.instrumentScheduler.tick(clampedTime)
+        this.importedAudioScheduler?.tick?.(clampedTime)
+        this.vocalScheduler.tick(clampedTime)
+        this.convertedVocalScheduler?.tick?.(clampedTime)
+
+        if (snapshot.duration > 0 && clampedTime >= snapshot.duration) {
+          this.transportStore.replace({
+            driver: 'idle',
+            playing: false,
+            currentTime: 0,
+            duration: snapshot.duration,
+          })
+          this.instrumentScheduler.stop()
+          this.importedAudioScheduler?.stop?.()
+          this.vocalScheduler.stop()
+          this.convertedVocalScheduler?.stop?.()
+          this._syncViewState(this.transportStore.getSnapshot())
+          this.view.setStatus(t('hostStatus.project_preview_done'))
+          this._logTrace('scheduleFrame:project-ended', {
+            clampedTime,
+          })
+          // 自然结束（不是用户暂停 / 停止）——通知监听者，例如 LUFS 自动达标完成
+          try { this.onPlaybackEndedNaturally?.({ duration: snapshot.duration }) }
+          catch (error) {
+            this.logger?.warn?.('onPlaybackEndedNaturally callback threw', {
+              error: error?.message || String(error),
+            })
+          }
+          return
+        }
+
+        const nextSnapshot = this.transportStore.patch({ currentTime: clampedTime })
+        this._syncViewTick(nextSnapshot)
+        this.rafId = requestAnimationFrame(tick)
+        return
+      }
+
+      if (snapshot.driver !== HOST_RECORD_DRIVER) {
+        this._logTrace('scheduleFrame:unexpected-driver', {
+          driver: snapshot.driver,
+        })
+        this._syncViewState(this.transportStore.patch({ playing: false }))
+        return
+      }
+
+      const nextSnapshot = this.transportStore.patch({
+        currentTime,
+        duration: Math.max(snapshot.duration || 0, currentTime),
+      })
+      this._syncViewTick(nextSnapshot)
+      this.rafId = requestAnimationFrame(tick)
+    }
+
+    this.rafId = requestAnimationFrame(tick)
+  }
+
+  _cancelFrame() {
+    if (this.rafId == null) return
+    cancelAnimationFrame(this.rafId)
+    this.rafId = null
+  }
+
+  _getCurrentSongTime() {
+    return this.clockStartedSongTime + (performance.now() - this.clockStartedAtMs) / 1000
+  }
+
+  async _startProjectPlaybackFromTime(currentTime, reason = 'play') {
+    const token = ++this.refreshToken
+    this._cancelFrame()
+    this._logTrace('startProjectPlaybackFromTime:entry', {
+      reason,
+      requestedTime: currentTime,
+      token,
+    })
+    try {
+      const prepared = await this._prepareProjectPlayback(currentTime)
+      this.view.hidePlaybackToast?.('preparing-playback')
+      if (token !== this.refreshToken) {
+        this._logTrace('startProjectPlaybackFromTime:stale-token-abort', {
+          reason,
+          requestedTime: currentTime,
+          token,
+        })
+        return false
+      }
+      if (!prepared.hasProjectDuration) {
+        this._logTrace('startProjectPlaybackFromTime:no-project-duration', {
+          reason,
+          requestedTime: currentTime,
+          token,
+        })
+        return false
+      }
+
+      this.transportStore.replace({
+        driver: HOST_PROJECT_DRIVER,
+        playing: true,
+        currentTime,
+        duration: prepared.duration,
+      })
+      this.clockStartedAtMs = performance.now()
+      this.clockStartedSongTime = currentTime
+      this._scheduleFrame()
+      this._syncViewState(this.transportStore.getSnapshot())
+      this.view.setStatus(this._buildPlaybackStatusText(prepared))
+      this.logger?.info?.(`宿主播放已同步 | 原因=${reason}`, {
+        currentTime,
+        instrumentSourceIds: prepared.instrumentSourceIds,
+        importedAudioTrackIds: prepared.importedAudioTrackIds,
+        vocalTrackIds: prepared.vocalTrackIds,
+      })
+      this._logTrace('startProjectPlaybackFromTime:started', {
+        reason,
+        requestedTime: currentTime,
+        duration: prepared.duration,
+        instrumentTrackCount: prepared.instrumentSourceIds.length,
+        importedAudioTrackCount: prepared.importedAudioTrackIds.length,
+        vocalTrackCount: prepared.vocalTrackIds.length,
+        convertedTrackCount: prepared.convertedTrackIds.length,
+      })
+      return true
+    } catch (error) {
+      this.view.hidePlaybackToast?.('preparing-playback')
+      this._logTrace('startProjectPlaybackFromTime:error', {
+        reason,
+        requestedTime: currentTime,
+        token,
+        error: error?.message || String(error),
+      })
+      throw error
+    }
+  }
+
+  async _prepareProjectPlayback(fromTimeSec) {
+    const project = this.projectStore.getProject()
+    if (!project) {
+      this._logTrace('prepareProjectPlayback:no-project', {
+        fromTimeSec,
+      })
+      return this._emptyPreparedState()
+    }
+
+    this._logTrace('prepareProjectPlayback:entry', {
+      fromTimeSec,
+      trackCount: project.tracks?.length || 0,
+    })
+
+    const updateToast = (text) => {
+      this.view.showPlaybackToast?.(text, {
+        tone: 'preparing',
+        durationMs: 0,
+        toastId: 'preparing-playback',
+      })
+    }
+
+    const audibleTrackIds = resolveAudibleTrackIds(project.tracks, this.sessionStore.getSnapshot())
+    const convertedPrepared = await this.convertedVocalScheduler.prepare({
+      tracks: project.tracks,
+      audibleTrackIds,
+      fromTimeSec,
+      onProgress: (current, total) => {
+        updateToast(`正在加载音色转换资源 (${current}/${total})… 受网络环境影响，此过程可能较慢。`)
+      },
+    })
+
+    updateToast('正在加载乐器与人声资源… 受网络环境影响，此过程可能较慢。')
+
+    const [instrumentPrepared, importedAudioPrepared, vocalPrepared] = await Promise.all([
+      this.instrumentScheduler.prepare({
+        tracks: project.tracks,
+        audibleTrackIds,
+        fromTimeSec,
+      }),
+      this.importedAudioScheduler?.prepare?.({
+        tracks: project.tracks,
+        audibleTrackIds,
+        fromTimeSec,
+      }) || Promise.resolve({
+        hasPlayableAudioTracks: false,
+        duration: 0,
+        trackIds: [],
+      }),
+      this.vocalScheduler.prepare({
+        tracks: project.tracks,
+        audibleTrackIds,
+        excludedTrackIds: new Set(convertedPrepared.trackIds || []),
+        fromTimeSec,
+      }),
+    ])
+
+    const duration = Math.max(
+      getProjectDuration(project.tracks),
+      instrumentPrepared.duration || 0,
+      importedAudioPrepared.duration || 0,
+      vocalPrepared.duration || 0,
+      convertedPrepared.duration || 0,
+      0,
+    )
+
+    this.logger?.info?.('HostTransport playback sources resolved', {
+      instrumentTrackCount: instrumentPrepared.sourceIds?.length || 0,
+      importedAudioTrackCount: importedAudioPrepared.trackIds?.length || 0,
+      vocalTrackCount: vocalPrepared.trackIds?.length || 0,
+      convertedVocalTrackCount: convertedPrepared.trackIds?.length || 0,
+      audibleTrackIds: [...audibleTrackIds],
+    })
+
+    if (duration <= 0) {
+      this.transportStore.patch({ driver: 'idle', playing: false, duration: 0 })
+      this._syncViewState(this.transportStore.getSnapshot())
+      this.view.setStatus(t('hostStatus.no_playable_track'))
+      return {
+        ...this._emptyPreparedState(),
+        instrumentSourceIds: instrumentPrepared.sourceIds || [],
+        importedAudioTrackIds: importedAudioPrepared.trackIds || [],
+        vocalTrackIds: vocalPrepared.trackIds || [],
+        convertedTrackIds: convertedPrepared.trackIds || [],
+      }
+    }
+
+    return {
+      duration,
+      hasProjectDuration: true,
+      instrumentSourceIds: instrumentPrepared.sourceIds || [],
+      importedAudioTrackIds: importedAudioPrepared.trackIds || [],
+      vocalTrackIds: vocalPrepared.trackIds || [],
+      convertedTrackIds: convertedPrepared.trackIds || [],
+    }
+  }
+
+  _emptyPreparedState() {
+    return {
+      duration: 0,
+      hasProjectDuration: false,
+      instrumentSourceIds: [],
+      importedAudioTrackIds: [],
+      vocalTrackIds: [],
+      convertedTrackIds: [],
+    }
+  }
+
+  _buildPlaybackStatusText(prepared) {
+    const labels = []
+    if (prepared.instrumentSourceIds.length > 0) labels.push(prepared.instrumentSourceIds.join(' / '))
+    if (prepared.importedAudioTrackIds.length > 0) labels.push(`${prepared.importedAudioTrackIds.length} 条音频`)
+    if (prepared.vocalTrackIds.length > 0) labels.push(`${prepared.vocalTrackIds.length} 条人声`)
+    if (prepared.convertedTrackIds.length > 0) labels.push(`${prepared.convertedTrackIds.length} 条已转换人声`)
+    return labels.length > 0
+      ? `正在播放项目预览 | ${labels.join(' / ')}`
+      : '正在播放项目预览'
+  }
+
+  _syncViewState(snapshot) {
+    this.view.setTransportTime(formatTransportTime(snapshot.currentTime))
+    this.lastTransportDisplayAtMs = performance.now()
+    this.view.setTimelinePlayheadTime?.(snapshot.currentTime)
+    this.view.setPlaybackActive(snapshot.playing)
+    this.runtimeTransportSync?.syncState?.(snapshot)
+    this._logTrace('syncViewState', {
+      viewTime: snapshot.currentTime,
+      driver: snapshot.driver,
+    })
+  }
+
+  _syncViewTick(snapshot) {
+    this.view.setTimelinePlayheadTime?.(snapshot.currentTime)
+    const now = performance.now()
+    if (now - this.lastTransportDisplayAtMs >= 50) {
+      this.view.setTransportTime(formatTransportTime(snapshot.currentTime))
+      this.lastTransportDisplayAtMs = now
+    }
+    this.runtimeTransportSync?.syncTick?.(snapshot)
+    if (now - this.lastViewTickTraceAtMs >= 250) {
+      this.lastViewTickTraceAtMs = now
+      this._logTrace('syncViewTick', {
+        viewTime: snapshot.currentTime,
+        driver: snapshot.driver,
+      })
+    }
+  }
+
+  _logTrace(message, extra = null) {
+    const snapshot = this.transportStore.getSnapshot()
+    this.logger?.debug?.('transport', `[TransportTrace] ${message}`, {
+      driver: snapshot.driver,
+      playing: snapshot.playing,
+      currentTime: snapshot.currentTime,
+      duration: snapshot.duration,
+      clockStartedSongTime: this.clockStartedSongTime,
+      rafActive: this.rafId != null,
+      refreshToken: this.refreshToken,
+      ...(extra || {}),
+    })
+  }
+}
+

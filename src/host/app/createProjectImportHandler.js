@@ -1,0 +1,102 @@
+import { t } from '../../i18n/index.js'
+
+export function createProjectImportHandler({
+  view,
+  transportCoordinator,
+  projectMixController = null,
+  projectAudioMixPersistence = null,
+  sessionStore = null,
+  vocalManifestController,
+  voiceConversionController,
+  resetImportedAudioAssets = null,
+  taskCoordinator,
+  predictionGateController,
+  prepWaiters,
+  persistEditorSnapshot,
+  bridge,
+  focusSoloController,
+  trackShellSessionController,
+  importService,
+  store,
+  render,
+}) {
+  function hasExistingProjectContext(project) {
+    if (!project) return false
+    const hasTracks = Array.isArray(project.tracks) && project.tracks.length > 0
+    const hasFileName = typeof project.fileName === 'string' && project.fileName.trim().length > 0
+    const hasFocusedTrack = Boolean(project.selectedTrackId || project.editorTrackId)
+    return hasTracks || hasFileName || hasFocusedTrack
+  }
+
+  return async function handleFileSelected(file) {
+    if (!file) return
+
+    try {
+      view.setStatus(t('voiceRuntime.parsing_midi'))
+      view.hidePlaybackToast('voice-language-reminder')
+
+      const previousProject = store.getProject()
+      const wasBlankState = !(previousProject?.tracks?.length > 0)
+      const hasCurrentProject = hasExistingProjectContext(previousProject)
+      const importedProject = await importService.importFile(file)
+      const hasImportedTiming = Boolean(
+        importedProject?.tempoData?.hasTempoInfo
+        || importedProject?.tempoData?.hasTimeSignatureInfo
+        || importedProject?.tempoData?.hasKeySignatureInfo,
+      )
+      let nextProject = importedProject
+
+      if (hasImportedTiming) {
+        const timingChoice = await view.promptProjectTimingImport({
+          fileName: importedProject.fileName,
+          importedTempoData: importedProject.tempoData,
+          currentTempoData: hasCurrentProject ? (previousProject?.tempoData || null) : null,
+          hasCurrentProject,
+        })
+        if (!timingChoice) {
+          view.setStatus(t('hostStatus.import_canceled'))
+          return
+        }
+        if (timingChoice === 'keep') {
+          nextProject = importService.applyProjectTiming(importedProject, {
+            tempoData: hasCurrentProject ? (previousProject?.tempoData || null) : null,
+            ppq: hasCurrentProject ? (previousProject?.ppq || importedProject.ppq) : importedProject.ppq,
+          })
+        }
+      }
+
+      transportCoordinator.reset()
+      vocalManifestController.resetProjectAssets()
+      voiceConversionController?.reset?.()
+      resetImportedAudioAssets?.()
+
+      const cancelledTrack = await taskCoordinator.cancelConflictingTask(null, '已切换到新的项目')
+      if (cancelledTrack && predictionGateController.getActiveTrackId() === cancelledTrack.id) {
+        prepWaiters.resolve(cancelledTrack.id, { ok: false, error: '任务已取消' })
+      }
+
+      await persistEditorSnapshot()
+      bridge.resetRuntime()
+      taskCoordinator.clearRuntimeTrack()
+      focusSoloController.clearCurrentTrack()
+      sessionStore?.setReverbDockOpen?.(false)
+      sessionStore?.setOpenReverbTrackIds?.([])
+      trackShellSessionController.closeSourcePicker(null, 'project-import')
+
+      const restoredProject = projectAudioMixPersistence?.restoreProject?.(nextProject) || nextProject
+      store.setProject(restoredProject)
+      projectAudioMixPersistence?.saveProject?.(store.getProject())
+      projectMixController?.syncProjectState?.(store.getProject())
+      render('project-imported')
+      if (wasBlankState) {
+        view.showEditorPlaceholder()
+      }
+      view.setStatus(t('hostStatus.project_imported', { count: nextProject.tracks.length }))
+    } catch (error) {
+      console.error('MIDI 导入失败:', error)
+      view.setStatus(t('voiceRuntime.midi_failed'))
+    } finally {
+      view.refs.fileInput.value = ''
+    }
+  }
+}
